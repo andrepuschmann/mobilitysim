@@ -40,7 +40,7 @@ class SecondaryUser(object):
         self.is_su = True
         self.finished = self.env.event()
         self.num_handover = 0
-        self.end_time = 0
+        self.end_time = -1
         self.verbose = verbose
         
         self.process = self.env.process(self.run())
@@ -50,26 +50,28 @@ class SecondaryUser(object):
 
     def run(self):
         while True:
-            # first check if we can find an idle channel
+            # try to find an idle channel randomly
             channel = None
-            for chan in self.channels:
+            for chan in np.random.permutation(self.channels):
                 if not chan.users:
                     channel = chan
 
             # if still no channel is free, among the busy ones, select
             # one randomly and wait until this one gets idle
             if channel == None:
+                if self.verbose: print('%s could not find a free channel, select one randomly and sleep ..' % (self.name))
                 channel = np.random.choice(self.channels)
                 while channel.users:
                     yield channel.users[0].busy_over
 
             assert(len(channel.users) == 0)
-            
+
             # from now on, the channel can be used
             channel.users.append(self) # tune to channel
 
             try:
                 start = self.env.now
+                if self.verbose: print('%s starts data transfer on %s after %.2f' % (self.name, channel.name, self.env.now))
                 yield self.env.process(self.transfer(self.t_time))
                 if self.verbose: print('data transfer finished after %.2f on %s, %d handover needed in total' % (self.env.now, channel.name, self.num_handover))
                 self.end_time = self.env.now
@@ -90,20 +92,38 @@ class SecondaryUser(object):
 
 
 class PrimaryUser(object):
-    def __init__(self, env, name, channels, load, verbose):
+    def __init__(self, env, name, channels, load, static, verbose):
         self.env = env
         self.name = name
         self.channels = channels
         self.load = load
+        self.static = static
         self.is_su = False
         self.busy_over = self.env.event()
         self.verbose = verbose
-        
+
         self.process = self.env.process(self.run())
 
     def run(self):
+        # in static mode, let each PU select its channel ..
+        if self.static:
+            channel = None
+            for chan in self.channels:
+                if not chan.users:
+                    channel = chan
+
+            # stop simulation if we have more PUs than channels
+            if channel == None:
+                print("Not enough channels, is M>=P?")
+                sys.exit()
+
+        # begin PU operation
         while True:
-            channel = np.random.choice(self.channels)
+            if not self.static:
+                channel = np.random.choice(self.channels)
+
+            # tune to channel
+            channel.users.append(self)
             if self.verbose: print('%s tunes to %s' % (self.name, channel.name))
            
             # look for SU users and interrupt them
@@ -112,9 +132,7 @@ class PrimaryUser(object):
                     # force SU handover and interrupt
                     channel.users.remove(user)
                     user.process.interrupt(self)
-            
-            channel.users.append(self) # tune to channel
-            
+
             # get length of next busy period
             busy_time = get_busy_period(self.load)                       
             if self.verbose: print('%s stays on %s for %.2f' % (self.name, channel.name, busy_time))
@@ -145,13 +163,14 @@ def main():
     parser.add_option("-a", "--pumodel", dest="pumodel", default=["verylow"],
                       help="PU activity pattern (verylow, low, medium, high, veryhigh)",
                       type='string', action='callback', callback=string_splitter)
+    parser.add_option("-c", "--static",
+                      action="store_true", dest="static", default=False,
+                      help="Force PU to stay on fixed channel all the time")
     parser.add_option("-i", "--iterations", dest="iterations", default=1,
                       help="How often to repeat the simulation")
     parser.add_option("-q", "--quiet",
                       action="store_false", dest="verbose", default=True,
                       help="don't print status messages to stdout")
-    parser.add_option("-f", "--file", dest="file",
-                      help="Write output to file", metavar="FILE")
     
     # turn command line parameters into local variables
     (options, args) = parser.parse_args()
@@ -160,6 +179,7 @@ def main():
     t_0 = int(options.t_0)
     t_switch = float(options.t_switch)
     num_pus = int(options.numpus)
+    static_pus = options.static
     iterations = int(options.iterations)
     verbose = options.verbose
 
@@ -168,24 +188,26 @@ def main():
 
     print("%d\t%d\t%.2f\t" % (M, num_pus, t_switch)),
     for model in pumodels:
-        t_total = []    
-        for run in range(iterations):           
+        t_total = []
+        for run in range(iterations):    
             env = simpy.Environment()
             channels = [Channel('channel%d' % i) for i in range(M)]
-            pus = [PrimaryUser(env, 'pu%d' % i, channels, model, verbose) for i in range(num_pus)]
+            pus = [PrimaryUser(env, 'pu%d' % i, channels, model, static_pus, verbose) for i in range(num_pus)]
             su = SecondaryUser(env, 'su1', channels, t_0, t_switch, verbose)
         
-            #env.run()    
+            #env.run()
             #env.run(until=1000)
             env.run(until=su.finished)
 
             # accumulate total transfer times
-            t_total.append(su.end_time)    
+            t_total.append(su.end_time)
 
         # calculate aggregated efficiency
         eff = t_0 / np.mean(t_total)
-        if verbose: print("Mean transfer time after %d iterations is %.2f, Eff: %.2f" % (len(t_total), np.mean(t_total), eff))
-        print("%.2f\t" % eff),
+        if verbose: 
+            print("Mean transfer time after %d iterations is %.2f, Eff: %.2f" % (len(t_total), np.mean(t_total), eff))
+        else:
+            print("%.2f\t" % eff),
     
     print ""
 
